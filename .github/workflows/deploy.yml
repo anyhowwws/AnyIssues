@@ -1,0 +1,130 @@
+name: Deploy
+
+# Optional: only works once terraform/cicd.tf has been applied with
+# enable_ci_deploy = true, the secrets below exist and the DEPLOY_ENABLED
+# repo variable is "true" (README, "Continuous deployment"). Without that,
+# PRs/pushes still get the test + validate jobs.
+#
+# Pushes to main deploy automatically -- no manual `terraform apply` needed.
+# PRs (and pushes to main) run tests + a backend-less terraform validate as
+# a gate; only a push to main additionally applies, via a short-lived AWS
+# role assumed over OIDC (see terraform/cicd.tf) -- no stored AWS keys.
+#
+# This repo is public, and so are its Actions logs. Anything that
+# identifies the deployment (AWS role ARN, state bucket, Anthropic
+# federation IDs, Telegram user ID, PAT) is an Actions *secret* -- masked
+# in logs -- never a variable, and plan/apply print only their summary
+# line (see the deploy steps below).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install boto3
+      - run: python -m py_compile lambdas/*/handler.py
+      - run: python -m unittest discover -s lambdas/tests -v
+
+  terraform-check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.8"
+      - run: terraform fmt -check -recursive
+      - run: terraform init -backend=false -input=false
+      - run: terraform validate
+
+  deploy:
+    # Opt-in per repo (set the DEPLOY_ENABLED variable to "true"), so a fork
+    # runs tests without a red deploy job on every push.
+    if: vars.DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: [test, terraform-check]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    defaults:
+      run:
+        working-directory: terraform
+    env:
+      TF_VAR_github_pat: ${{ secrets.TF_VAR_GITHUB_PAT }}
+      TF_VAR_github_owner: ${{ vars.TF_VAR_GITHUB_OWNER }}
+      TF_VAR_allowed_telegram_user_id: ${{ secrets.TF_VAR_ALLOWED_TELEGRAM_USER_ID }}
+      TF_VAR_anthropic_federation_rule_id: ${{ secrets.TF_VAR_ANTHROPIC_FEDERATION_RULE_ID }}
+      TF_VAR_anthropic_organization_id: ${{ secrets.TF_VAR_ANTHROPIC_ORGANIZATION_ID }}
+      TF_VAR_anthropic_service_account_id: ${{ secrets.TF_VAR_ANTHROPIC_SERVICE_ACCOUNT_ID }}
+      TF_VAR_anthropic_workspace_id: ${{ secrets.TF_VAR_ANTHROPIC_WORKSPACE_ID }}
+      TF_VAR_enable_ci_deploy: "true" # keep the role + state bucket this job relies on
+      TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+    steps:
+      - uses: actions/checkout@v4
+      # Fail before touching anything if a secret is missing. The three WIF
+      # IDs are optional (API-key-only setups leave them out) but all-or-none:
+      # a partial set would silently apply WIF as "off".
+      - name: Check required secrets
+        run: |
+          missing=0
+          for v in TF_VAR_github_pat TF_VAR_github_owner TF_VAR_allowed_telegram_user_id TF_STATE_BUCKET; do
+            if [ -z "${!v}" ]; then echo "::error::$v is not set"; missing=1; fi
+          done
+          wif=0
+          for v in TF_VAR_anthropic_federation_rule_id TF_VAR_anthropic_organization_id TF_VAR_anthropic_service_account_id; do
+            [ -n "${!v}" ] && wif=$((wif + 1))
+          done
+          if [ "$wif" -ne 0 ] && [ "$wif" -ne 3 ]; then
+            echo "::error::set all three TF_VAR_ANTHROPIC_* WIF secrets, or none"; missing=1
+          fi
+          exit $missing
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ap-southeast-1
+          mask-aws-account-id: true
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.8"
+          terraform_wrapper: false
+      - run: cp backend.tf.example backend.tf
+      - run: terraform init -input=false -backend-config="bucket=$TF_STATE_BUCKET"
+      # Full plan/apply output would publish every resource address -- one
+      # label resource per repo the owner has, private repos included -- plus
+      # the webhook URL. Keep it in a file on the runner; print only the
+      # summary (or the error lines on failure). Run `terraform plan`
+      # locally when you need the detail.
+      - name: terraform plan
+        run: |
+          if ! terraform plan -input=false -no-color -out=tfplan > plan.log 2>&1; then
+            grep -E 'Error:' plan.log || echo "plan failed; run terraform plan locally for details"
+            exit 1
+          fi
+          # An outputs-only plan prints neither "Plan:" nor "No changes.", just
+          # "Changes to Outputs:" -- the plan succeeded, so don't fail on it.
+          grep -E '^(Plan:|No changes\.|Changes to Outputs:)' plan.log || echo "plan succeeded"
+      - name: terraform apply
+        run: |
+          if ! terraform apply -input=false -no-color -auto-approve tfplan > apply.log 2>&1; then
+            grep -E 'Error:' apply.log || echo "apply failed; run terraform plan locally for details"
+            exit 1
+          fi
+          grep -E '^Apply complete!' apply.log || echo "apply succeeded"

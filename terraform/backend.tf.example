@@ -1,0 +1,17 @@
+# Remote state in S3, used by the GitHub Actions deploy. Copy to backend.tf
+# (gitignored) to enable it; leave it out to keep local state.
+#
+# The bucket is created by cicd.tf (enable_ci_deploy = true) and its name
+# embeds the AWS account ID, so it isn't committed. Supply it at init:
+#
+#   terraform init -backend-config="bucket=$(terraform output -raw terraform_state_bucket)" -migrate-state
+#
+# Native S3 locking (Terraform >= 1.13) -- no DynamoDB lock table needed.
+terraform {
+  backend "s3" {
+    key          = "anyissues/terraform.tfstate"
+    region       = "ap-southeast-1"
+    use_lockfile = true
+    encrypt      = true
+  }
+}

@@ -1,0 +1,50 @@
+# Copy to terraform.tfvars (gitignored) and fill in. Every value here is
+# yours alone -- never commit the filled-in copy.
+
+# ---------------- Required ----------------
+
+github_owner   = "your-github-username"
+github_pat     = "github_pat_xxx"          # fine-grained, scoped as described in README.
+                                            # Used only to authenticate the `github` provider
+                                            # itself (repo search + label sync). The bot token,
+                                            # Anthropic key, and a second copy of this PAT are
+                                            # NOT set here -- see README, they're provisioned
+                                            # directly into SSM Parameter Store.
+braindump_repo = "braindump"               # must already exist on GitHub
+
+allowed_telegram_user_id = 000000000        # your numeric id from @userinfobot
+
+# ---------------- Your daily digest ----------------
+# When the "what's outstanding?" summary of your open issues arrives on
+# Telegram. EventBridge Scheduler cron: cron(minutes hours day-of-month month
+# day-of-week year), evaluated in digest_timezone (IANA name). Defaults shown.
+#
+#   cron(0 18 * * ? *)        every day at 18:00
+#   cron(30 8 ? * MON-FRI *)  weekdays at 08:30
+#   cron(0 9 ? * MON *)       Mondays at 09:00
+#
+# digest_schedule = "cron(0 18 * * ? *)"
+# digest_timezone = "Asia/Singapore"         # e.g. "Europe/London", "America/New_York"
+# digest_enabled  = true                     # false pauses the schedule; /digest still works
+
+# ---------------- Optional ----------------
+
+# aws_region      = "ap-southeast-1"         # also change it in your SSM put-parameter commands
+# project_name    = "anyissues"              # prefixes every AWS resource and SSM path
+# anthropic_model = "claude-sonnet-5"
+# draft_ttl_hours = 24                       # unconfirmed drafts expire after this
+
+# Keyless Claude auth via Workload Identity Federation (optional). Leave these
+# out to use the SSM-stored API key. Set up after your first deploy -- see
+# README "Optional: keyless Claude auth"; the rule's match must be the CEL
+# expression from `terraform output -raw anthropic_wif_cel_expression`.
+# anthropic_federation_rule_id = "fdrl_..."
+# anthropic_organization_id    = "<org uuid>"
+# anthropic_service_account_id = "svac_..."
+# anthropic_workspace_id       = "wrkspc_..." # only if the rule is enabled in several workspaces
+
+# GitHub Actions deploy + S3 remote state (optional; see README
+# "Continuous deployment"). Off = deploy from your machine with local state.
+# Once on, keep it on: the state bucket has prevent_destroy.
+# enable_ci_deploy = true
+# ci_github_repo   = "AnyIssues"             # your fork's repo name, if different

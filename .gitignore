@@ -1,0 +1,30 @@
+# Secrets — never commit
+.env
+*.key
+*-key.json
+credentials
+terraform/terraform.tfvars
+terraform/backend.tf
+*.tfvars
+!*.tfvars.example
+
+# Terraform
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/terraform.tfstate
+terraform/terraform.tfstate.*
+terraform/build/
+crash.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Local agent config (harness permissions, machine-specific notes)
+.claude/
+
+# macOS
+.DS_Store
