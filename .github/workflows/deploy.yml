@@ -111,11 +111,13 @@ jobs:
       # label resource per repo the owner has, private repos included -- plus
       # the webhook URL. Keep it in a file on the runner; print only the
       # summary (or the error lines on failure). Run `terraform plan`
-      # locally when you need the detail.
+      # locally when you need the detail. Error lines can still name a repo
+      # (GitHub API paths, quoted resource keys), so they go through
+      # a sed first that masks owner/repo paths and every quoted string.
       - name: terraform plan
         run: |
           if ! terraform plan -input=false -no-color -out=tfplan > plan.log 2>&1; then
-            grep -E 'Error:' plan.log || echo "plan failed; run terraform plan locally for details"
+            grep -E 'Error:' plan.log | sed -E 's#(github\.com/(repos/)?)[^/[:space:]]+/[^/[:space:]:"]+#\1<owner>/<repo>#g; s#"[^"]*"#"<redacted>"#g' | grep . || echo "plan failed; run terraform plan locally for details"
             exit 1
           fi
           # An outputs-only plan prints neither "Plan:" nor "No changes.", just
@@ -124,7 +126,7 @@ jobs:
       - name: terraform apply
         run: |
           if ! terraform apply -input=false -no-color -auto-approve tfplan > apply.log 2>&1; then
-            grep -E 'Error:' apply.log || echo "apply failed; run terraform plan locally for details"
+            grep -E 'Error:' apply.log | sed -E 's#(github\.com/(repos/)?)[^/[:space:]]+/[^/[:space:]:"]+#\1<owner>/<repo>#g; s#"[^"]*"#"<redacted>"#g' | grep . || echo "apply failed; run terraform plan locally for details"
             exit 1
           fi
           grep -E '^Apply complete!' apply.log || echo "apply succeeded"
