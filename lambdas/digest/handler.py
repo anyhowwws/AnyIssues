@@ -7,11 +7,19 @@ prioritised summary, and sends it to the owner on Telegram with the question
 "which one do you want to start first?".
 
 Two entry points, one handler:
-- EventBridge Scheduler (daily cron)  -> event is {} / {"source": "schedule"};
-                                         sends a fresh message to ALLOWED_USER_ID.
-- /digest command on Telegram         -> webhook_handler async-invokes this
-                                         function with {"chat_id", "message_id"};
-                                         the summary replaces that placeholder.
+- EventBridge Scheduler (daily cron)  -> event is {"source": "schedule",
+                                         "scheduled_time": ISO-8601}; sends a fresh
+                                         message to ALLOWED_USER_ID.
+- /digest or /daily on Telegram       -> webhook_handler async-invokes this
+                                         function with {"chat_id", "message_id",
+                                         "mode"}; the summary replaces that placeholder.
+
+Two modes:
+- "full"   every open issue. Mondays' scheduled run, and /digest.
+- "focus"  drops urgency:good-to-have issues and everything in BRAINDUMP_REPO,
+           which wait for Monday. Every other day's scheduled run, and /daily.
+A scheduled run with nothing left to report sends nothing at all; an on-demand
+one always answers, since its placeholder is waiting.
 
 Kept dependency-free (stdlib only: urllib, json, boto3) so `terraform apply`
 never needs a separate pip-install/build step.
@@ -25,7 +33,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from decimal import Decimal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import boto3
 
@@ -36,6 +46,8 @@ ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
 TELEGRAM_BOT_TOKEN_PARAM = os.environ["TELEGRAM_BOT_TOKEN_PARAM"]
 ANTHROPIC_API_KEY_PARAM = os.environ["ANTHROPIC_API_KEY_PARAM"]
 GITHUB_PAT_PARAM = os.environ["GITHUB_PAT_PARAM"]
+# Same IANA zone the schedule fires in, so "Monday" means the owner's Monday.
+DIGEST_TIMEZONE = os.environ.get("DIGEST_TIMEZONE", "UTC")
 
 ssm = boto3.client("ssm")
 
@@ -339,19 +351,81 @@ def linkify(text, issues):
     return pattern.sub(lambda m: f'<a href="{by_ref[m.group(1)]}">{m.group(1)}</a>', escaped)
 
 
-def build_digest(issues):
-    repos = sorted({i["repo"] for i in issues})
+MODES = ("full", "focus")
+
+
+def is_parked(issue):
+    """Held back from the focus digest until Monday's full one."""
+    return issue["repo"] == BRAINDUMP_REPO or urgency_of(issue) == "good-to-have"
+
+
+def split_for_mode(issues, mode):
+    """(issues to report, number held back)."""
+    if mode == "full":
+        return issues, 0
+    shown = [i for i in issues if not is_parked(i)]
+    return shown, len(issues) - len(shown)
+
+
+def _plural(n, word):
+    return f"{n} {word}{'s' if n != 1 else ''}"
+
+
+def build_digest(issues, mode="full", parked=0):
+    """`issues` is what to report (already filtered for `mode`); `parked` is
+    how many the focus filter held back, mentioned in a footer."""
     if not issues:
+        if mode == "focus" and parked:
+            return (
+                f"\u2705 Nothing ASAP or normal open. {_plural(parked, 'good-to-have/braindump item')} "
+                "parked for Monday -- /digest shows everything."
+            )
         return "\U0001f389 Nothing open across your tracked repos. Enjoy the quiet."
-    n_issues = f"{len(issues)} open issue{'s' if len(issues) != 1 else ''}"
-    n_repos = f"{len(repos)} repo{'s' if len(repos) != 1 else ''}"
-    header = f"\U0001f4cb <b>{n_issues}</b> across {n_repos}\n\n"
+    n_repos = len({i["repo"] for i in issues})
+    scope = " (ASAP + normal)" if mode == "focus" else ""
+    header = f"\U0001f4cb <b>{_plural(len(issues), 'open issue')}</b>{scope} across {_plural(n_repos, 'repo')}\n\n"
     try:
         body = summarise_with_llm(issues)
     except Exception as e:  # noqa: BLE001 - the digest must still go out
         print(f"LLM summary failed, sending raw list: {type(e).__name__}: {e}")
         body = issues_as_text(issues) + "\n\nWhich one do you want to start first?"
-    return header + linkify(body, issues)
+    footer = ""
+    if parked:
+        footer = (
+            f"\n\n\U0001f4a4 {_plural(parked, 'good-to-have/braindump item')} parked for Monday "
+            "-- /digest shows everything."
+        )
+    return header + linkify(body, issues) + footer
+
+
+def _scheduled_day(event):
+    """The weekday the schedule fired for, in DIGEST_TIMEZONE. Prefers the
+    scheduler's own scheduled time over now, so a retry that lands after
+    midnight still counts as the day it was meant for."""
+    try:
+        tz = ZoneInfo(DIGEST_TIMEZONE)
+    except (ZoneInfoNotFoundError, ValueError):
+        print(f"unknown DIGEST_TIMEZONE {DIGEST_TIMEZONE!r}, using UTC")
+        tz = timezone.utc
+    when = None
+    raw = event.get("scheduled_time")
+    if raw:
+        try:
+            when = datetime.fromisoformat(raw)
+        except ValueError:
+            print(f"unparseable scheduled_time {raw!r}, using now")
+    if when is None or when.tzinfo is None:
+        when = datetime.now(timezone.utc)
+    return when.astimezone(tz)
+
+
+def resolve_mode(event):
+    """(mode, scheduled?). Scheduled runs are full on Mondays, focus otherwise;
+    on-demand runs say which they want (default full, as /digest always was)."""
+    if "chat_id" not in event:
+        return ("full" if _scheduled_day(event).weekday() == 0 else "focus"), True
+    mode = event.get("mode", "full")
+    return (mode if mode in MODES else "full"), False
 
 
 # ---------------------------------------------------------------- delivery
@@ -401,11 +475,16 @@ def lambda_handler(event, context):
     event = event or {}
     chat_id = event.get("chat_id", ALLOWED_USER_ID)
     message_id = event.get("message_id")
+    mode, scheduled = resolve_mode(event)
     try:
         issues = collect_issues()
     except Exception as e:  # noqa: BLE001 - tell the user rather than dying silently
         print(f"digest failed: {type(e).__name__}: {e}")
         deliver(chat_id, "⚠️ Couldn't build the digest -- GitHub call failed, check the logs.", message_id)
         raise
-    deliver(chat_id, build_digest(issues), message_id)
-    return {"statusCode": 200, "issues": len(issues)}
+    shown, parked = split_for_mode(issues, mode)
+    if scheduled and not shown:
+        print(f"{mode} digest skipped: nothing to report ({parked} parked)")
+        return {"statusCode": 200, "mode": mode, "issues": 0, "parked": parked, "skipped": True}
+    deliver(chat_id, build_digest(shown, mode, parked), message_id)
+    return {"statusCode": 200, "mode": mode, "issues": len(shown), "parked": parked, "skipped": False}

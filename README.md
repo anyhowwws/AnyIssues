@@ -20,9 +20,12 @@ ready for you or a coding agent to pick up.
   forks, not archived), fetched live from GitHub. There's nothing to register.
 - **Eureka ideas** for apps that don't exist yet go to a single `braindump`
   repo.
-- **Daily digest** of every open issue across your repos, summarised by Claude
-  and delivered at the time and timezone you set. Send `/digest` any time for
-  one on demand.
+- **Daily digest** of your open issues, summarised by Claude and delivered at
+  the time and timezone you set. Mondays get everything; other days only
+  ASAP + normal issues (good-to-have and braindump wait for Monday), and a day
+  with nothing to report sends nothing.
+- **Commands in the chat's `/` menu:** `/daily` (today's focus list), `/digest`
+  (everything open) and `/help`, any time.
 - **Yours, and nearly free.** It runs in your own AWS account on pay-per-use
   services (Lambda, SQS, DynamoDB, EventBridge Scheduler), set up with one
   `terraform apply`.
@@ -171,6 +174,14 @@ The default is every day at 18:00 Singapore time. Some examples:
 such as `Europe/London` or `America/New_York`. You can change either at any
 time; it takes effect on the next `terraform apply`.
 
+What each run contains is decided by the day, in that timezone:
+
+| Day | Sends |
+|---|---|
+| Monday | every open issue, good-to-have and braindump included |
+| Any other day | only `urgency:asap`, `urgency:normal` and unlabelled issues outside braindump, with a count of what's parked for Monday |
+| Nothing left to report | nothing at all |
+
 ### 7. Deploy
 
 From the `terraform/` folder:
@@ -214,8 +225,17 @@ into a title and acceptance criteria with project / type / urgency buttons.
 Tap through and hit **Confirm** to get the issue link. **Edit** makes your next
 message a correction to the same draft; **Discard** drops it.
 
-Send `/digest` to get your outstanding-work summary right away. The scheduled
-one arrives at the time you set in step 6.
+Tap the `/` menu button in the chat for the bot's commands (the menu appears
+after your first message to the bot):
+
+| Command | Does |
+|---|---|
+| `/daily` | today's focus list: ASAP + normal issues, braindump excluded |
+| `/digest` | the full report: everything open |
+| `/help` | lists the commands |
+
+Commands always answer, even when there's nothing open. The scheduled digest
+arrives at the time you set in step 6.
 
 **Created a new repo later?** Run `terraform apply` again so it gets the
 labels. Filing into a repo without them fails.
@@ -240,6 +260,8 @@ Things that live in code:
 
 - **Ticket style:** `SYSTEM_PROMPT` in `lambdas/shape_worker/handler.py`
 - **Digest style:** `SYSTEM_PROMPT` in `lambdas/digest/handler.py`
+- **What's held back on non-Mondays:** `is_parked()` in `lambdas/digest/handler.py`
+- **Chat commands:** `COMMANDS` in `lambdas/webhook_handler/handler.py`
 - **Label names and colours:** `terraform/github_labels.tf` (the button values
   in the handlers must match)
 
@@ -423,8 +445,8 @@ cd terraform && terraform init -backend=false && terraform validate && terraform
 - **Failures are explained.** If Claude refuses or returns something unusable,
   the draft is marked failed and the bot asks you to resend. Temporary errors
   (rate limits, outages) are retried up to 3 times.
-- **The digest always arrives.** If the Claude call fails, you still get a
-  plain list grouped by repo.
+- **The digest always arrives when there's something to say.** If the Claude
+  call fails, you still get a plain list grouped by repo.
 
 ## Known limitations
 

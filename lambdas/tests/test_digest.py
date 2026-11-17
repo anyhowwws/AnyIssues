@@ -8,6 +8,14 @@ from _harness import FakeHTTP, llm_response, load_handler, reset_module, wif_ena
 
 D = load_handler("digest")
 
+# Scheduler sends UTC; DIGEST_TIMEZONE is Asia/Singapore (UTC+8) in the harness.
+MONDAY_SGT = "2026-11-15T17:00:00Z"  # Sunday in UTC, 01:00 Monday in Singapore
+TUESDAY_SGT = "2026-11-16T18:00:00Z"  # 02:00 Tuesday in Singapore
+
+
+def scheduled(when):
+    return {"source": "schedule", "scheduled_time": when}
+
 
 def gh_issue(repo, number, title, labels=(), pull_request=False):
     item = {
@@ -168,7 +176,7 @@ class Summary(DigestTestCase):
 
 class Delivery(DigestTestCase):
     def test_scheduled_run_sends_to_owner(self):
-        result = D.lambda_handler({"source": "schedule"}, None)
+        result = D.lambda_handler(scheduled(MONDAY_SGT), None)
         self.assertEqual(result["issues"], 3)
         (msg,) = self.http.sent("telegram", "sendMessage")
         self.assertEqual(msg["chat_id"], 42)  # ALLOWED_USER_ID
@@ -209,6 +217,77 @@ class Delivery(DigestTestCase):
         self.assertNotIn("/anyissues-test/github-pat", D._cache)
 
 
+class Schedule(DigestTestCase):
+    """Full list on Mondays; ASAP + normal otherwise; silence when empty."""
+
+    def test_monday_sends_everything(self):
+        result = D.lambda_handler(scheduled(MONDAY_SGT), None)
+        self.assertEqual((result["mode"], result["issues"], result["parked"]), ("full", 3, 0))
+        (msg,) = self.http.sent("telegram", "sendMessage")
+        self.assertIn('href="https://github.com/owner/braindump/issues/3"', msg["text"])
+        self.assertNotIn("parked", msg["text"])
+
+    def test_other_days_drop_good_to_have_and_braindump(self):
+        result = D.lambda_handler(scheduled(TUESDAY_SGT), None)
+        self.assertEqual((result["mode"], result["issues"], result["parked"]), ("focus", 1, 2))
+        (req,) = self.http.sent("anthropic")
+        content = req["messages"][0]["content"]
+        self.assertIn("repo-a#1", content)
+        self.assertNotIn("repo-b#7", content)
+        self.assertNotIn("braindump#3", content)
+        (msg,) = self.http.sent("telegram", "sendMessage")
+        self.assertTrue(msg["text"].startswith("\U0001f4cb <b>1 open issue</b> (ASAP + normal) across 1 repo"))
+        self.assertIn("2 good-to-have/braindump items parked for Monday", msg["text"])
+
+    def test_weekday_follows_digest_timezone_not_utc(self):
+        # MONDAY_SGT is still Sunday in UTC; it must count as Monday.
+        self.assertEqual(D._scheduled_day(scheduled(MONDAY_SGT)).weekday(), 0)
+        self.assertEqual(D.resolve_mode(scheduled(MONDAY_SGT)), ("full", True))
+        self.assertEqual(D.resolve_mode(scheduled(TUESDAY_SGT)), ("focus", True))
+
+    def test_unsubstituted_or_missing_scheduled_time_falls_back_to_now(self):
+        for event in ({"source": "schedule"}, scheduled("<aws.scheduler.scheduled-time>")):
+            with self.subTest(event=event):
+                mode, is_scheduled = D.resolve_mode(event)
+                self.assertTrue(is_scheduled)
+                self.assertIn(mode, D.MODES)
+
+    def test_focus_day_with_only_parked_issues_sends_nothing(self):
+        self.github.issues_by_repo["repo-a"] = []
+        result = D.lambda_handler(scheduled(TUESDAY_SGT), None)
+        self.assertTrue(result["skipped"])
+        self.assertEqual(result["parked"], 2)
+        self.assertEqual(self.http.sent("telegram"), [])
+        self.assertEqual(self.http.sent("anthropic"), [])
+
+    def test_monday_with_nothing_open_sends_nothing(self):
+        self.github.issues_by_repo = {}
+        result = D.lambda_handler(scheduled(MONDAY_SGT), None)
+        self.assertTrue(result["skipped"])
+        self.assertEqual(self.http.sent("telegram"), [])
+
+
+class OnDemand(DigestTestCase):
+    def test_daily_command_uses_focus_mode(self):
+        result = D.lambda_handler({"chat_id": 42, "message_id": 555, "mode": "focus"}, None)
+        self.assertEqual((result["mode"], result["issues"], result["parked"]), ("focus", 1, 2))
+        (edit,) = self.http.sent("telegram", "editMessageText")
+        self.assertIn("(ASAP + normal)", edit["text"])
+
+    def test_on_demand_never_skips_even_when_empty(self):
+        self.github.issues_by_repo["repo-a"] = []
+        result = D.lambda_handler({"chat_id": 42, "message_id": 555, "mode": "focus"}, None)
+        self.assertFalse(result["skipped"])
+        (edit,) = self.http.sent("telegram", "editMessageText")
+        self.assertIn("Nothing ASAP or normal open", edit["text"])
+        self.assertIn("2 good-to-have/braindump items parked", edit["text"])
+
+    def test_missing_or_unknown_mode_means_full(self):
+        for event in ({"chat_id": 42, "message_id": 1}, {"chat_id": 42, "message_id": 1, "mode": "bogus"}):
+            with self.subTest(event=event):
+                self.assertEqual(D.resolve_mode(event), ("full", False))
+
+
 class WebhookDigestCommand(unittest.TestCase):
     def setUp(self):
         self.W = load_handler("webhook_handler")
@@ -232,11 +311,68 @@ class WebhookDigestCommand(unittest.TestCase):
                 kw = self.W.lambda_client.invoke.call_args.kwargs
                 self.assertEqual(kw["FunctionName"], "anyissue-digest")
                 self.assertEqual(kw["InvocationType"], "Event")
-                self.assertEqual(json.loads(kw["Payload"]), {"chat_id": 42, "message_id": 777})
+                self.assertEqual(json.loads(kw["Payload"]), {"chat_id": 42, "message_id": 777, "mode": "full"})
         self.assertIn("building digest", self.http.sent("telegram", "sendMessage")[0]["text"])
         # Even with an edit pending, /digest is a command, not a correction.
         self.W.drafts_table.update_item.assert_not_called()
         self.W.sqs.send_message.assert_not_called()
+
+    def test_daily_command_invokes_digest_in_focus_mode(self):
+        self.send("/daily")
+        payload = json.loads(self.W.lambda_client.invoke.call_args.kwargs["Payload"])
+        self.assertEqual(payload["mode"], "focus")
+
+    def test_help_and_unknown_commands_reply_with_the_command_list(self):
+        for text in ("/help", "/start", "/nope"):
+            with self.subTest(text=text):
+                self.http.calls.clear()
+                self.send(text)
+                (msg,) = self.http.sent("telegram", "sendMessage")
+                self.assertIn("/daily", msg["text"])
+                self.assertIn("/digest", msg["text"])
+        self.W.lambda_client.invoke.assert_not_called()
+        self.W.sqs.send_message.assert_not_called()
+
+    def test_slash_text_that_is_not_a_command_still_becomes_a_draft(self):
+        self.W.drafts_table.scan.return_value = {"Items": []}
+        self.send("/etc/hosts gets overwritten on boot")
+        self.W.sqs.send_message.assert_called_once()
+        self.W.lambda_client.invoke.assert_not_called()
+
+    def test_command_menu_registered_once_per_container(self):
+        self.W._menu["registered"] = False
+        self.W.drafts_table.scan.return_value = {"Items": []}
+        self.send("first thought")
+        self.send("second thought")
+        (cmds,) = self.http.sent("telegram", "setMyCommands")
+        self.assertEqual([c["command"] for c in cmds["commands"]], ["daily", "digest", "help"])
+        for c in cmds["commands"]:
+            self.assertLessEqual(len(c["description"]), 256)
+
+    def test_command_menu_failure_is_harmless_and_retried(self):
+        self.W._menu["registered"] = False
+        self.W.drafts_table.scan.return_value = {"Items": []}
+        real = self.http.telegram
+
+        def flaky(path, body):
+            if path.endswith("setMyCommands"):
+                raise urllib.error.HTTPError(path, 500, "x", {}, io.BytesIO(b"{}"))
+            return real(path, body)
+
+        self.http.telegram = flaky
+        self.assertEqual(self.send("a thought")["statusCode"], 200)
+        self.W.sqs.send_message.assert_called_once()
+        self.assertFalse(self.W._menu["registered"])
+        self.http.telegram = real
+        self.send("another thought")
+        self.assertTrue(self.W._menu["registered"])
+
+    def test_strangers_do_not_trigger_menu_registration(self):
+        from _harness import message_update, webhook_event
+
+        self.W._menu["registered"] = False
+        self.W.lambda_handler(webhook_event(message_update(10, "hi", user_id=999)), None)
+        self.assertEqual(self.http.calls, [])
 
     def test_ordinary_text_does_not_invoke_digest(self):
         self.W.drafts_table.scan.return_value = {"Items": []}
@@ -247,7 +383,7 @@ class WebhookDigestCommand(unittest.TestCase):
 
 class WorkloadIdentityFederation(DigestTestCase):
     def run_digest(self):
-        return D.lambda_handler({"source": "schedule"}, None)
+        return D.lambda_handler(scheduled(MONDAY_SGT), None)
 
     def test_default_state_uses_the_ssm_key_not_wif(self):
         self.run_digest()
