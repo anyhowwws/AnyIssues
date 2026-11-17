@@ -8,8 +8,11 @@ Single entry point for the Telegram webhook.
 - callback_query (button tap)   -> handled entirely here, synchronously:
                                     mutate the draft, re-render the keyboard,
                                     and on Confirm, create the GitHub issue.
-- /digest command               -> post a placeholder and async-invoke the
+- /digest, /daily commands      -> post a placeholder and async-invoke the
                                     digest Lambda, which edits the summary in.
+- /help, /start                 -> list the commands.
+The command list is also pushed to Telegram (setMyCommands) once per warm
+container, so the chat's "/" menu always matches the deployed code.
 
 Kept dependency-free (stdlib only: urllib, json, boto3) so `terraform apply`
 never needs a separate pip-install/build step.
@@ -17,6 +20,7 @@ never needs a separate pip-install/build step.
 import base64
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -199,7 +203,45 @@ def handle_edit_message(draft, text):
     enqueue_shape(draft["draft_id"], is_edit=True)
 
 
-def handle_digest_command(chat_id):
+# Shown in Telegram's "/" menu. Order is the menu order.
+COMMANDS = (
+    ("daily", "Today's focus: ASAP + normal issues"),
+    ("digest", "Full report: everything open, incl. good-to-have + braindump"),
+    ("help", "What this bot does"),
+)
+DIGEST_MODES = {"digest": "full", "daily": "focus"}
+_COMMAND_RE = re.compile(r"^/([A-Za-z0-9_]{1,32})(?:@\w+)?$")
+
+HELP_TEXT = (
+    "Send any thought as plain text and I'll shape it into a GitHub issue for you to confirm.\n\n"
+    + "\n".join(f"/{name} - {desc}" for name, desc in COMMANDS)
+    + "\n\nThe scheduled digest sends everything on Mondays, only ASAP + normal on other days, "
+    "and stays quiet when there's nothing to report."
+)
+
+_menu = {"registered": False}
+
+
+def register_commands():
+    """Best effort, once per container: a failure here must never cost the
+    user their message, and the next cold start simply tries again."""
+    if _menu["registered"]:
+        return
+    try:
+        _telegram("setMyCommands", {"commands": [{"command": n, "description": d} for n, d in COMMANDS]})
+        _menu["registered"] = True
+    except Exception as e:  # noqa: BLE001 - cosmetic; never break the update
+        print(f"setMyCommands failed: {type(e).__name__}: {e}")
+
+
+def parse_command(text):
+    """'/digest@bot now' -> 'digest'. Only a well-formed command token counts,
+    so a thought like '/etc/hosts is wrong' still becomes a draft."""
+    match = _COMMAND_RE.match(text.split(maxsplit=1)[0])
+    return match.group(1).lower() if match else None
+
+
+def handle_digest_command(chat_id, mode="full"):
     """The digest takes several GitHub calls plus an LLM round-trip -- far too
     slow for a webhook response -- so it runs in its own Lambda, invoked
     asynchronously, and edits its result into the placeholder posted here."""
@@ -207,7 +249,9 @@ def handle_digest_command(chat_id):
     lambda_client.invoke(
         FunctionName=DIGEST_FUNCTION_NAME,
         InvocationType="Event",
-        Payload=json.dumps({"chat_id": chat_id, "message_id": placeholder["result"]["message_id"]}).encode(),
+        Payload=json.dumps(
+            {"chat_id": chat_id, "message_id": placeholder["result"]["message_id"], "mode": mode}
+        ).encode(),
     )
 
 
@@ -416,7 +460,16 @@ def lambda_handler(event, context):
         _handle_update(update)
     except Exception as e:  # noqa: BLE001 - deliberate catch-all at the boundary
         print(f"update {update.get('update_id')} failed: {type(e).__name__}: {e}")
+    if _sender_id(update) == ALLOWED_USER_ID:
+        register_commands()  # after the update, so it never delays the user's reply
     return {"statusCode": 200, "body": "ok"}
+
+
+def _sender_id(update):
+    for key in ("callback_query", "message"):
+        if key in update:
+            return (update[key].get("from") or {}).get("id")
+    return None
 
 
 def _already_seen(update_id):
@@ -466,8 +519,12 @@ def _handle_update(update):
         return
 
     chat_id = message["chat"]["id"]
-    if text.split(maxsplit=1)[0].split("@")[0].lower() == "/digest":
-        handle_digest_command(chat_id)
+    command = parse_command(text)
+    if command in DIGEST_MODES:
+        handle_digest_command(chat_id, DIGEST_MODES[command])
+        return
+    if command is not None:  # /help, /start, or anything unrecognised
+        _telegram("sendMessage", {"chat_id": chat_id, "text": HELP_TEXT})
         return
 
     pending_edit = find_awaiting_edit_draft(chat_id)

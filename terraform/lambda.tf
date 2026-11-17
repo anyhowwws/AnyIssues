@@ -113,7 +113,7 @@ resource "aws_lambda_permission" "apigw_invoke" {
 }
 
 # Outstanding-work digest. Fired daily by EventBridge Scheduler, or on demand
-# when webhook_handler async-invokes it for a /digest command.
+# when webhook_handler async-invokes it for a /digest or /daily command.
 resource "aws_lambda_function" "digest" {
   function_name    = "${var.project_name}-digest"
   role             = aws_iam_role.digest.arn
@@ -133,6 +133,7 @@ resource "aws_lambda_function" "digest" {
       TELEGRAM_BOT_TOKEN_PARAM = local.ssm.telegram_bot_token
       ANTHROPIC_API_KEY_PARAM  = local.ssm.anthropic_api_key
       GITHUB_PAT_PARAM         = local.ssm.github_pat
+      DIGEST_TIMEZONE          = var.digest_timezone # "Monday" = Monday here
 
       # Workload identity federation -- see the comment in variables.tf.
       # Falls back to ANTHROPIC_API_KEY_PARAM above if unset.

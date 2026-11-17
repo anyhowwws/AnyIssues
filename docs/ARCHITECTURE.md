@@ -28,7 +28,7 @@ Telegram ──▶ API Gateway ──▶ webhook_handler ──▶ SQS ──▶
    │                             │  └── button taps (sync): mutate draft, re-render
    │                             └──── Confirm ──▶ GitHub: create issue
    │
-   └──── digest ◀── EventBridge Scheduler (daily) / `/digest` (async invoke)
+   └──── digest ◀── EventBridge Scheduler (daily) / `/digest`, `/daily` (async invoke)
                      reads open issues across repos ──▶ Claude summary
 ```
 
@@ -53,7 +53,16 @@ Telegram ──▶ API Gateway ──▶ webhook_handler ──▶ SQS ──▶
    repo. It orders them by repo, with the most `urgency:asap` issues first and
    braindump last, and by urgency within each repo. Claude summarises the list,
    `repo#123` tokens become links, and the result ends by asking which one to
-   start first.
+   start first. Scheduled runs are **full** on Mondays (in `digest_timezone`)
+   and **focus** otherwise: `urgency:good-to-have` issues and everything in
+   braindump are held back and only counted. A scheduled run with nothing left
+   to report sends no message. `/digest` (full) and `/daily` (focus) always
+   reply.
+6. **Commands.** `/daily`, `/digest`, `/help` (plus `/start` and any unknown
+   `/command`, which get the help text). The webhook pushes the list to
+   Telegram with `setMyCommands` once per warm container, after the owner's
+   update is handled, so the `/` menu tracks the deployed code with no setup
+   step.
 
 ## Key decisions
 
@@ -69,6 +78,8 @@ Telegram ──▶ API Gateway ──▶ webhook_handler ──▶ SQS ──▶
 | **Secrets in SSM, never in Terraform state** | This replaced Secrets Manager, whose `secret_version` resource puts the plaintext credential in `terraform.tfstate`. SSM parameters are created out-of-band, and Terraform only interpolates their *paths*. Deliberately, there is no `data "aws_ssm_parameter"` either, because that also writes the decrypted value into state. | Terraform no longer checks that the parameters exist. Also removes Secrets Manager's per-secret monthly fee. |
 | **API key by default, Workload Identity Federation optional** | A new user gets running with one SSM-stored API key. WIF is an opt-in upgrade: each Lambda gets an AWS-signed JWT for its own IAM role from `sts:GetWebIdentityToken` and exchanges it for a short-lived Anthropic token. Terraform outputs the exact CEL match expression for the federation rule, so nobody hand-builds role ARNs. | WIF failures fall back to the key silently, so the README tells users to check the logs once. |
 | **GitHub Actions → AWS via OIDC** | No stored AWS keys. The deploy role trusts only `main` of this repo, never PRs from forks, and its policy is scoped to this project's resource-name prefixes rather than admin. | Opt-in (`enable_ci_deploy`), so forks can deploy from a laptop with no bootstrap. |
+| **Weekday decided in the Lambda** | Scheduler passes `<aws.scheduler.scheduled-time>`, so one schedule and one `digest_schedule` cron stay as they were; a retry after midnight still counts as the intended day | Needs the runtime's tz database; an unknown zone falls back to UTC with a log line |
+| **`setMyCommands` from the webhook, once per container** | No manual curl step, menu can't drift from code | One extra Telegram call per cold start (after the reply, failures ignored) |
 
 ## Reliability and correctness
 
@@ -79,8 +90,8 @@ Telegram ──▶ API Gateway ──▶ webhook_handler ──▶ SQS ──▶
   call fails, the claim is released so you can retry.
 - **No retry storms.** The webhook always returns 200 after logging a handler
   error, so one bad update can't loop forever.
-- **The digest always arrives.** If the Claude call fails, it falls back to a
-  plain grouped list. It's also split to fit Telegram's 4,096-character
+- **The digest always arrives when there's something to report.** If the
+  Claude call fails, it falls back to a plain grouped list. It's also split to fit Telegram's 4,096-character
   limit.
 - **Credential rotation without a deploy.** Secrets are cached per container,
   and any 401/403 evicts the cached value, so a rotated secret is picked up on
@@ -145,13 +156,14 @@ cloud:
 
 ## Testing
 
-73 `unittest` tests (standard library only: no pytest, no moto). The harness
+88 `unittest` tests (standard library only: no pytest, no moto). The harness
 fakes the DynamoDB table, SQS, SSM, STS and Lambda clients, and routes every
 `urllib` call to Telegram, GitHub or Anthropic to a scripted responder. The
 responder records every request and can simulate an HTTP failure per host. Covered: duplicate `update_id` produces
 one draft; double Confirm produces one issue; Markdown-hostile LLM output
 renders; permanent versus transient LLM failures; WIF token exchange and
-fallback; digest ordering, linkifying and chunking; reserved-word aliasing.
+fallback; digest ordering, linkifying and chunking; Monday/focus modes and
+empty-day skipping; chat commands and menu registration; reserved-word aliasing.
 CI runs the suite plus `terraform fmt`/`validate` on every PR.
 
 ## Roadmap

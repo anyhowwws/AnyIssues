@@ -37,6 +37,7 @@ ENV = {
     "ANTHROPIC_API_KEY_PARAM": "/anyissues-test/anthropic-api-key",
     "GITHUB_PAT_PARAM": "/anyissues-test/github-pat",
     "DIGEST_FUNCTION_NAME": "anyissue-digest",
+    "DIGEST_TIMEZONE": "Asia/Singapore",
     # Left unset by default: _wif_configured() is False, so every test exercises
     # the SSM-key fallback path exactly as before. WIF-specific tests set the
     # three module-level constants directly (see wif_enabled() below) rather
@@ -70,6 +71,10 @@ def reset_module(module):
         module.sts.get_web_identity_token.return_value = {"WebIdentityToken": "eyJ.fake-jwt.sig"}
     if hasattr(module, "_wif"):
         module._wif.clear()
+    if hasattr(module, "_menu"):
+        # Pretend the "/" menu is already pushed so tests that count Telegram
+        # calls stay exact; the menu tests reset this themselves.
+        module._menu["registered"] = True
 
 
 class wif_enabled:
