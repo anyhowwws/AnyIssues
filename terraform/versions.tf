@@ -1,5 +1,5 @@
 terraform {
-  required_version = ">= 1.5"
+  required_version = ">= 1.7" # import blocks with for_each (github_labels.tf)
   required_providers {
     aws = {
       source  = "hashicorp/aws"

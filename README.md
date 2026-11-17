@@ -65,7 +65,7 @@ bot that only answers you and files issues into **your** repos.
 **Tools on your machine:**
 [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
 (logged in to your account), [Terraform](https://developer.hashicorp.com/terraform/install)
-1.5 or newer, the [GitHub CLI](https://cli.github.com/) (`gh`), and Python 3
+1.7 or newer, the [GitHub CLI](https://cli.github.com/) (`gh`), and Python 3
 (Terraform uses it to package the Lambdas).
 
 **What you'll collect along the way:**
